@@ -175,6 +175,8 @@ static int hyper_body_chunk(void *userdata, const hyper_buf *chunk)
   }
   if(k->ignorebody)
     return HYPER_ITER_CONTINUE;
+  if(0 == len)
+    return HYPER_ITER_CONTINUE;
   Curl_debug(data, CURLINFO_DATA_IN, buf, len);
   if(!data->set.http_ce_skip && k->writer_stack)
     /* content-encoded data */
@@ -203,11 +205,8 @@ static CURLcode status_line(struct Curl_easy *data,
                             const uint8_t *reason, size_t rlen)
 {
   CURLcode result;
-  size_t wrote;
   size_t len;
   const char *vstr;
-  curl_write_callback writeheader =
-    data->set.fwrite_header? data->set.fwrite_header: data->set.fwrite_func;
   vstr = http_version == HYPER_HTTP_VERSION_1_1 ? "1.1" :
     (http_version == HYPER_HTTP_VERSION_2 ? "2" : "1.0");
   conn->httpversion =
@@ -230,12 +229,12 @@ static CURLcode status_line(struct Curl_easy *data,
   len = Curl_dyn_len(&data->state.headerb);
   Curl_debug(data, CURLINFO_HEADER_IN, Curl_dyn_ptr(&data->state.headerb),
              len);
-  Curl_set_in_callback(data, true);
-  wrote = writeheader(Curl_dyn_ptr(&data->state.headerb), 1, len,
-                      data->set.writeheader);
-  Curl_set_in_callback(data, false);
-  if(wrote != len)
-    return CURLE_WRITE_ERROR;
+  result = Curl_client_write(data, CLIENTWRITE_HEADER,
+                             Curl_dyn_ptr(&data->state.headerb), len);
+  if(result) {
+    data->state.hresult = CURLE_ABORTED_BY_CALLBACK;
+    return HYPER_ITER_BREAK;
+  }
 
   data->info.header_size += (long)len;
   data->req.headerbytecount += (long)len;
@@ -319,6 +318,8 @@ CURLcode Curl_hyper_stream(struct Curl_easy *data,
         failf(data, "Hyper: [%d] %.*s", (int)code, (int)errlen, errbuf);
         if((code == HYPERE_UNEXPECTED_EOF) && !data->req.bytecount)
           result = CURLE_GOT_NOTHING;
+        else if(code == HYPERE_INVALID_PEER_MESSAGE)
+          result = CURLE_UNSUPPORTED_PROTOCOL; /* maybe */
         else
           result = CURLE_RECV_ERROR;
       }
@@ -531,8 +532,12 @@ static int uploadpostfields(void *userdata, hyper_context *ctx,
     *chunk = NULL; /* nothing more to deliver */
   else {
     /* send everything off in a single go */
-    *chunk = hyper_buf_copy(data->set.postfields,
-                            (size_t)data->req.p.http->postsize);
+    hyper_buf *copy = hyper_buf_copy(data->set.postfields,
+                                     (size_t)data->req.p.http->postsize);
+    if(copy)
+      *chunk = copy;
+    else
+      return HYPER_POLL_ERROR;
     data->req.upload_done = TRUE;
   }
   return HYPER_POLL_READY;
@@ -551,8 +556,13 @@ static int uploadstreamed(void *userdata, hyper_context *ctx,
   if(!fillcount)
     /* done! */
     *chunk = NULL;
-  else
-    *chunk = hyper_buf_copy((uint8_t *)data->state.ulbuf, fillcount);
+  else {
+    hyper_buf *copy = hyper_buf_copy((uint8_t *)data->state.ulbuf, fillcount);
+    if(copy)
+      *chunk = copy;
+    else
+      return HYPER_POLL_ERROR;
+  }
   return HYPER_POLL_READY;
 }
 
@@ -810,8 +820,8 @@ CURLcode Curl_http(struct Curl_easy *data, bool *done)
 #endif
 
   Curl_safefree(data->state.aptr.ref);
-  if(data->change.referer && !Curl_checkheaders(data, "Referer")) {
-    data->state.aptr.ref = aprintf("Referer: %s\r\n", data->change.referer);
+  if(data->state.referer && !Curl_checkheaders(data, "Referer")) {
+    data->state.aptr.ref = aprintf("Referer: %s\r\n", data->state.referer);
     if(!data->state.aptr.ref)
       return CURLE_OUT_OF_MEMORY;
     if(Curl_hyper_header(data, headers, data->state.aptr.ref))
@@ -882,6 +892,10 @@ CURLcode Curl_http(struct Curl_easy *data, bool *done)
   }
   conn->datastream = Curl_hyper_stream;
 
+  /* clear userpwd and proxyuserpwd to avoid re-using old credentials
+   * from re-used connections */
+  Curl_safefree(data->state.aptr.userpwd);
+  Curl_safefree(data->state.aptr.proxyuserpwd);
   return CURLE_OK;
   error:
 

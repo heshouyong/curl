@@ -129,8 +129,6 @@ struct tftp_state_data {
   int             retries;
   int             retry_time;
   int             retry_max;
-  time_t          start_time;
-  time_t          max_time;
   time_t          rx_time;
   struct Curl_sockaddr_storage   local_addr;
   struct Curl_sockaddr_storage   remote_addr;
@@ -184,6 +182,7 @@ const struct Curl_handler Curl_handler_tftp = {
   tftp_disconnect,                      /* disconnect */
   ZERO_NULL,                            /* readwrite */
   ZERO_NULL,                            /* connection_check */
+  ZERO_NULL,                            /* attach connection */
   PORT_TFTP,                            /* defport */
   CURLPROTO_TFTP,                       /* protocol */
   CURLPROTO_TFTP,                       /* family */
@@ -206,8 +205,6 @@ static CURLcode tftp_set_timeouts(struct tftp_state_data *state)
   timediff_t timeout_ms;
   bool start = (state->state == TFTP_STATE_START) ? TRUE : FALSE;
 
-  time(&state->start_time);
-
   /* Compute drop-dead time */
   timeout_ms = Curl_timeleft(state->data, NULL, start);
 
@@ -216,9 +213,6 @@ static CURLcode tftp_set_timeouts(struct tftp_state_data *state)
     failf(state->data, "Connection time-out");
     return CURLE_OPERATION_TIMEDOUT;
   }
-
-  /* timeout in milliseconds */
-  state->max_time = timeout_ms;
 
   if(timeout_ms > 0)
     maxtime = (time_t)(timeout_ms + 500) / 1000;
@@ -326,7 +320,7 @@ static CURLcode tftp_parse_option_ack(struct tftp_state_data *state,
     const char *option, *value;
 
     tmp = tftp_option_get(tmp, ptr + len - tmp, &option, &value);
-    if(tmp == NULL) {
+    if(!tmp) {
       failf(data, "Malformed ACK packet, rejecting");
       return CURLE_TFTP_ILLEGAL;
     }
@@ -783,7 +777,7 @@ static CURLcode tftp_tx(struct tftp_state_data *state, tftp_event_t event)
         return result;
       state->sbytes += (int)cb;
       state->data->req.upload_fromhere += cb;
-    } while(state->sbytes < state->blksize && cb != 0);
+    } while(state->sbytes < state->blksize && cb);
 
     sbytes = sendto(state->sockfd, (void *) state->spacket.data,
                     4 + state->sbytes, SEND_4TH_ARG,
@@ -1263,7 +1257,7 @@ static CURLcode tftp_multi_statemach(struct Curl_easy *data, bool *done)
       failf(data, "%s", Curl_strerror(error, buffer, sizeof(buffer)));
       state->event = TFTP_EVENT_ERROR;
     }
-    else if(rc != 0) {
+    else if(rc) {
       result = tftp_receive_packet(data);
       if(result)
         return result;
